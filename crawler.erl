@@ -281,25 +281,13 @@ compose_url({ok,Result}) ->
          ++ Path
          ++ Query.
 
-if_not_empty(Test, Result) -> % не хватает в эрланге тренарного оператора ? : 
-    case Test of
-        [] ->
-            [];
-        _ ->
-            Result
-    end.
+if_not_empty([_], Result) -> Result;  % не хватает в эрланге тренарного оператора ?: 
+if_not_empty([],       _) -> [].
 
-filter_default_port({Scheme, Port}) ->
-    case {Scheme, Port} of
-        {http, 80} ->
-            [];
-        {https, 443} ->
-            [];
-        {ftp, 21} ->
-            [];
-        _ ->
-            Port
-    end.
+filter_default_port({http,   80})    -> [];
+filter_default_port({https, 443})    -> [];
+filter_default_port({ftp,    21})    -> [];
+filter_default_port({_Scheme, Port}) -> Port.
 
 skip_query(Url) ->
     QPos = string:str(Url, "?"),
