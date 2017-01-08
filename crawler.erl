@@ -17,71 +17,63 @@ crawler(Url) ->
 
 %% вызываем рекурсивную процедуру загрузки
 crawler(Url, NumWorkers) when NumWorkers >= 1 ->
-    {ok,[_, Host, _, _, _]} = parse_url(string:to_lower(Url)),
+    {ok,[_,Host,_,_,_]} = parse_url(string:to_lower(Url)),
     inets:start(), % запускаем службы httpc
     ssl:start(),
-    FreeWorkers = lists:map(fun(_) -> spawn(crawler, worker, [self()]) end, lists:seq(1, NumWorkers)), % запускаем нужное количество воркеров
+    FreeWorkerPids = [ spawn(crawler, worker, [self()]) || _ <- lists:seq(1, NumWorkers) ], % запускаем нужное количество воркеров
     erlang:send_after(10000, self(), save_state),    % через 10 секунд хотим сохранить состояние загрузки
     case file:consult(Host ++ ".state") of   % пытаемся восстановить состояние прерванной загрузки
         {ok, [[Host, UrlsRestored, SeenUrlsRestored]]} -> 
             io:format("Resume download session~n"),
-            crawler([], UrlsRestored, FreeWorkers, SeenUrlsRestored, [], Host);
+            crawler([], UrlsRestored, FreeWorkerPids, SeenUrlsRestored, [], Host);
         _ -> 
-            crawler([], [Url], FreeWorkers, [], [], Host)
+            crawler([], [Url], FreeWorkerPids, [], [], Host)
     end.
 
 %% @doc рекурсивная процедура загрузки
 %% раздаём задания воркерам,
 %% ожидаем сообщения от воркеров, в которых они передают новые задания для загрузки
 %% ожидаем сообщение от таймера, по которому сохраняем текущее состояние загрузки в файл
-crawler([], [], FreeWorkers, _SeenUrls, _UrlsInProgress, Host) ->  % паттерн завершения работы, всё загружено
-    lists:foreach(fun(Pid) -> exit(Pid, stop) end, FreeWorkers),  % посылаем сигналы остановки воркерам
+crawler([], [], FreeWorkerPids, _SeenUrls, _UrlsInProgress, Host) ->  % паттерн завершения работы, всё загружено
+    [ exit(Pid, stop) || Pid <- FreeWorkerPids ],  % посылаем сигналы остановки воркерам
     file:delete(Host ++ ".state"), %  удаляем файл состояния загрузки
     ssl:stop(),  % останавливаем службы httpc
     inets:stop(),
     io:format("Crawler finished~n");
-crawler(Workers, Urls, FreeWorkers, SeenUrls, UrlsInProgress, Host) when length(Urls) > 0, length(FreeWorkers) > 0 -> % паттерн раздачи заданий по воркерам
-    [Url | UrlsLeft] = sets:to_list(sets:from_list(Urls)),
-    [Worker | WorkersLeft] = FreeWorkers,
-    Worker ! {url, Url},
-    crawler( [Worker] ++ Workers, UrlsLeft, WorkersLeft, SeenUrls, [Url] ++ UrlsInProgress, Host); 
-crawler(Workers, Urls, FreeWorkers, SeenUrls, UrlsInProgress, Host) -> % ждать сообщений, если нет свободных воркеров или нет свободных урлов
+crawler(WorkerPids, [Url|UrlsLeft], [WorkerPid|WorkerPidsLeft], SeenUrls, UrlsInProgress, Host) -> % паттерн раздачи заданий по воркерам
+    WorkerPid ! {url, Url},
+    crawler( [WorkerPid|WorkerPids], UrlsLeft, WorkerPidsLeft, SeenUrls, [Url|UrlsInProgress], Host); 
+crawler(WorkerPids, Urls, FreeWorkerPids, SeenUrls, UrlsInProgress, Host) when FreeWorkerPids =:= [] orelse Urls =:= [] -> % ждать сообщений, если нет свободных воркеров или нет свободных урлов
     receive
         save_state -> % это от таймера. Сохраним состояние и вернёмся в ожидание
             io:format("saving state...~n"),
             file:write_file(Host ++ ".state", io_lib:format("~p.~n", [[Host, lists:append(Urls, UrlsInProgress), SeenUrls]])),
             erlang:send_after(10000, self(), save_state),    % через 10 секунд снова хотим сохранить состояние загрузки
-            crawler(Workers, Urls, FreeWorkers, SeenUrls, UrlsInProgress, Host);
+            crawler(WorkerPids, Urls, FreeWorkerPids, SeenUrls, UrlsInProgress, Host);
         {worker, Pid, urls_to_fetch, NewUrls, url_fetched, Url} -> % воркер прислал новые урлы
-            crawler( lists:delete(Pid,Workers), 
-                     Urls ++ lists:filter(fun(U) ->     % фильтруем новые задания, не берем те, что уже сделаны или с других хостов
-                                                  {ok, [_, HostToCheck, _, _, _]} = parse_url(U), 
-                                                  IsForFetch = string:equal(HostToCheck, Host) 
-                                                               andalso not lists:member(U, UrlsInProgress)
-                                                               andalso not lists:member(U, SeenUrls),
-                                                  IsForFetch
-                                          end, NewUrls),
-                     [Pid] ++ FreeWorkers, 
-                     [Url] ++ SeenUrls, 
-                     lists:delete(Url, UrlsInProgress),
-                     Host)
+            crawler(lists:delete(Pid,WorkerPids), 
+                    %% фильтруем новые задания, не берем те, что уже сделаны или с других хостов
+                    [U || U <- NewUrls, is_url_of_host(U, Host) andalso not lists:member(U, [UrlsInProgress|SeenUrls])], 
+                    [Pid|FreeWorkerPids], 
+                    [Url|SeenUrls], 
+                    lists:delete(Url, UrlsInProgress),
+                    Host)
     after 15000 ->
             io:format("Crawler timed out~n") % что-то пошло не так
     end.
 
-
 %% @private
-worker(Parent) -> 
+worker(ParentPid) -> 
     receive
         {url, Url} ->
 %           io:format("url to fetch ~s~n",[Url]),
-            Parent ! { worker, self(),
-                       urls_to_fetch, fetch_and_save(Url),
-                       url_fetched, Url
-                     },
-            worker(Parent)
+            ParentPid ! { worker, self(),
+                          urls_to_fetch, fetch_and_save(Url),
+                          url_fetched, Url
+                        },
+            worker(ParentPid)
     after 10000 ->
-            io:format("worker ~w timed out. Parent ~w~n",[self(), Parent])
+            io:format("worker ~w timed out. Parent ~w~n",[self(), ParentPid])
     end.
 
 fetch_and_save(Url) ->
@@ -95,7 +87,7 @@ fetch_and_save(Url) ->
         {ok, RequestId} ->
             {Html, UrlsToFetch} = parse_html(receive_text_data(RequestId), Url),
             save_to_file(Html, path_to_index(Url)),
-            UrlsToFetch
+            sets:to_list(sets:from_list(UrlsToFetch)) % возвращаем урлы, удалив дубликаты
     end.
 
 receive_text_data(RequestId) ->
@@ -113,7 +105,7 @@ receive_text_data(RequestId, Accumulator) ->
                     []
             end;
         {http, {RequestId, stream, BinBodyPart}} ->
-            receive_text_data( RequestId, [BinBodyPart] ++ Accumulator );
+            receive_text_data( RequestId, [BinBodyPart|Accumulator] );
         {http, {RequestId, stream_end, _Headers}} ->
             list_to_binary(lists:reverse(Accumulator))
     after 10000 ->
@@ -123,14 +115,7 @@ receive_text_data(RequestId, Accumulator) ->
     end.
 
 is_text_headers(Headers) ->
-    lists:any(fun({Header, Value}) -> 
-                      case Header of
-                          "content-type" ->
-                              string:str(Value, "text/") == 1;
-                          _ ->
-                              false
-                      end
-              end, Headers).
+  0 < length([ ok || {Header, Value} <- Headers, Header =:= "content-type", string:str(Value, "text/") == 1 ]).
 
 %% @doc возвращает html с преобразованными ссылками из абсолютных в относительные и список ссылок для загрузки
 extract_links([], _Html, ParsedParts, _Pos, _BaseUrl, Links) ->
@@ -139,10 +124,10 @@ extract_links([[{Start, Len}] | Positions], Html, ParsedParts, Pos, BaseUrl, Lin
     Link = binary_to_list(binary:part(Html, Start, Len)),
     extract_links( Positions,
                    Html,
-                   [path_to_index(skip_query(url_to_relative(Link, BaseUrl))), binary_to_list(binary:part(Html, Start, Pos - Start))] ++ ParsedParts,
-                   Start+Len,
+                   [path_to_index(skip_query(url_to_relative(Link, BaseUrl))), binary_to_list(binary:part(Html, Start, Pos - Start)) | ParsedParts],
+                   Start + Len,
                    BaseUrl,
-                   [skip_query(url_to_absolute(Link, BaseUrl))] ++ Links
+                   [skip_query(url_to_absolute(Link, BaseUrl)) | Links]
                  ).
 
 parse_html(Html, BaseUrl) ->
@@ -232,7 +217,7 @@ url_to_relative(Url, BaseUrl) ->
                     Path = string:tokens(Right,"/"),
                     BasePath = string:tokens(BaseRight,"/"),
                     {PreparedP, PreparedB} = strip_common_head(Path, BasePath),
-                    string:join(lists:append([["."], lists:map(fun(_) -> ".." end, PreparedB), PreparedP]),"/")
+                    string:join(lists:append([["."], [".." || _ <- PreparedB], PreparedP]), "/")
             end
     end.
 
@@ -265,6 +250,15 @@ remove_double_dots(Path) ->
         false ->
             remove_double_dots(NewPath)
     end.
+
+is_url_of_host(Url, Host) ->
+    case re:run(Url,"^https?://" ++ Host, [caseless]) of
+        {match, _} ->                   
+            true;
+        nomatch ->
+            false
+    end.
+    
 
 normalize_url(Url) ->
     case re:run(Url,"^https?:",[caseless]) of
