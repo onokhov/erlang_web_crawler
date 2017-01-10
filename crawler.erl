@@ -7,7 +7,7 @@
 
 -export([ crawler/1
         , crawler/2
-        , worker/1
+        , worker/2
         ]).
 
 %% @doc Загружает рекурсивно документы с сайта начиная с Url данного в параметрах.
@@ -16,68 +16,60 @@ crawler(Url) ->
     crawler(Url, 1).
 
 %% вызываем рекурсивную процедуру загрузки
-crawler(Url, NumWorkers) when NumWorkers >= 1 ->
+crawler(Url, WorkersMaxNum) when WorkersMaxNum >= 1 ->
     {ok,[_,Host,_,_,_]} = parse_url(string:to_lower(Url)),
     inets:start(), % запускаем службы httpc
     ssl:start(),
-    FreeWorkerPids = [ spawn(crawler, worker, [self()]) || _ <- lists:seq(1, NumWorkers) ], % запускаем нужное количество воркеров
     erlang:send_after(10000, self(), save_state),    % через 10 секунд хотим сохранить состояние загрузки
     case file:consult(Host ++ ".state") of   % пытаемся восстановить состояние прерванной загрузки
-        {ok, [[Host, UrlsRestored, SeenUrlsRestored]]} -> 
+        {ok, [[UrlsRestored, SeenUrlsRestored]]} -> 
             io:format("Resume download session~n"),
-            crawler([], UrlsRestored, FreeWorkerPids, SeenUrlsRestored, [], Host);
+            crawler(WorkersMaxNum, 0, Host, UrlsRestored, SeenUrlsRestored, []);
         _ -> 
-            crawler([], [Url], FreeWorkerPids, [], [], Host)
-    end.
-
+            crawler(WorkersMaxNum, 0, Host, [Url], [], [])
+    end,
+    ssl:stop(),  % останавливаем службы httpc
+    inets:stop(),
+    io:format("Crawler finished~n");
+crawler(_,_) ->
+    io:format("Usage: crawler:crawler(Url, MaxWorkersNum) Url = string, MaxWorkersNum = integer > 0~n").
+    
 %% @doc рекурсивная процедура загрузки
 %% раздаём задания воркерам,
 %% ожидаем сообщения от воркеров, в которых они передают новые задания для загрузки
 %% ожидаем сообщение от таймера, по которому сохраняем текущее состояние загрузки в файл
-crawler([], [], FreeWorkerPids, _SeenUrls, _UrlsInProgress, Host) ->  % паттерн завершения работы, всё загружено
-    [ exit(Pid, stop) || Pid <- FreeWorkerPids ],  % посылаем сигналы остановки воркерам
-    file:delete(Host ++ ".state"), %  удаляем файл состояния загрузки
-    ssl:stop(),  % останавливаем службы httpc
-    inets:stop(),
-    io:format("Crawler finished~n");
-crawler(WorkerPids, [Url|UrlsLeft], [WorkerPid|WorkerPidsLeft], SeenUrls, UrlsInProgress, Host) -> % паттерн раздачи заданий по воркерам
-    WorkerPid ! {url, Url},
-    crawler( [WorkerPid|WorkerPids], UrlsLeft, WorkerPidsLeft, SeenUrls, [Url|UrlsInProgress], Host); 
-crawler(WorkerPids, Urls, FreeWorkerPids, SeenUrls, UrlsInProgress, Host) when FreeWorkerPids =:= [] orelse Urls =:= [] -> % ждать сообщений, если нет свободных воркеров или нет свободных урлов
+crawler(_WorkersMaxNum, 0, Host, [], _SeenUrls, _UrlsInProgress) ->  % паттерн завершения работы, всё загружено
+    file:delete(Host ++ ".state"); %  удаляем файл состояния загрузки
+crawler(WorkersMaxNum, WorkersNum, Host, [Url|UrlsLeft], SeenUrls, UrlsInProgress) when WorkersNum < WorkersMaxNum -> % паттерн раздачи заданий по воркерам
+    spawn(crawler, worker, [self(), Url]),
+    crawler(WorkersMaxNum, WorkersNum + 1, Host, UrlsLeft, SeenUrls, [Url|UrlsInProgress]); 
+crawler(WorkersMaxNum, WorkersNum, Host, Urls, SeenUrls, UrlsInProgress) when WorkersMaxNum == WorkersNum orelse Urls =:= [] -> % ждать сообщений, если нет свободных воркеров или нет свободных урлов
     receive
         save_state -> % это от таймера. Сохраним состояние и вернёмся в ожидание
             io:format("saving state...~n"),
-            file:write_file(Host ++ ".state", io_lib:format("~p.~n", [[Host, lists:append(Urls, UrlsInProgress), SeenUrls]])),
+            file:write_file(Host ++ ".state", io_lib:format("~p.~n", [[UrlsInProgress ++ Urls, SeenUrls]])),
             erlang:send_after(10000, self(), save_state),    % через 10 секунд снова хотим сохранить состояние загрузки
-            crawler(WorkerPids, Urls, FreeWorkerPids, SeenUrls, UrlsInProgress, Host);
-        {worker, Pid, urls_to_fetch, NewUrls, url_fetched, Url} -> % воркер прислал новые урлы
-            crawler(lists:delete(Pid,WorkerPids), 
+            crawler(WorkersMaxNum, WorkersNum, Host, Urls, SeenUrls, UrlsInProgress);
+        [UrlFetched, NewUrls] -> % воркер прислал новые урлы
+            crawler(WorkersMaxNum,
+                    WorkersNum - 1,
+                    Host,
                     %% фильтруем новые задания, не берем те, что уже сделаны или с других хостов
-                    [U || U <- NewUrls, is_url_of_host(U, Host) andalso not lists:member(U, [UrlsInProgress|SeenUrls])], 
-                    [Pid|FreeWorkerPids], 
-                    [Url|SeenUrls], 
-                    lists:delete(Url, UrlsInProgress),
-                    Host)
+                    [U || U <- NewUrls, is_url_of_host(U, Host) andalso not lists:member(U, SeenUrls) andalso not lists:member(U, UrlsInProgress)], 
+                    [UrlFetched|SeenUrls], 
+                    lists:delete(UrlFetched, UrlsInProgress)
+                    )
     after 15000 ->
             io:format("Crawler timed out~n") % что-то пошло не так
     end.
 
 %% @private
-worker(ParentPid) -> 
-    receive
-        {url, Url} ->
-%           io:format("url to fetch ~s~n",[Url]),
-            ParentPid ! { worker, self(),
-                          urls_to_fetch, fetch_and_save(Url),
-                          url_fetched, Url
-                        },
-            worker(ParentPid)
-    after 10000 ->
-            io:format("worker ~w timed out. Parent ~w~n",[self(), ParentPid])
-    end.
+worker(ParentPid, Url) -> 
+    ParentPid ! [ Url, fetch_and_save(Url) ].
 
 fetch_and_save(Url) ->
     %% асинхронный запрос, чтоб на этапе разбора заголовков можно было отказаться от загрузки нетекстовых документов
+    %% проверять через метод HEAD не получается, т.к. некоторые сайты его попросту запрещают
     io:format("fetch ~s~n",[Url]),
     R = httpc:request(get, {Url, []}, [], [{sync, false}, {stream, self}, {full_result, false}]),
     case R of
@@ -115,7 +107,7 @@ receive_text_data(RequestId, Accumulator) ->
     end.
 
 is_text_headers(Headers) ->
-  0 < length([ ok || {Header, Value} <- Headers, Header =:= "content-type", string:str(Value, "text/") == 1 ]).
+    [] =/= [ ok || {"content-type", [$t,$e,$x,$t,$/|_]} <- Headers ].
 
 %% @doc возвращает html с преобразованными ссылками из абсолютных в относительные и список ссылок для загрузки
 extract_links([], _Html, ParsedParts, _Pos, _BaseUrl, Links) ->
@@ -273,21 +265,21 @@ scheme_to_string(Scheme) ->
 
 compose_url({ok,Result}) ->
     compose_url(Result);
- compose_url({Scheme, UserInfo, Host, Port, Path, Query}) ->
+compose_url({Scheme, UserInfo, Host, Port, Path, Query}) ->
      scheme_to_string(Scheme) ++ "://"
          ++ if_not_empty(UserInfo, UserInfo ++ "@")
          ++ string:to_lower(Host)
-         ++ if_not_empty(filter_default_port({Scheme, Port}), ":" ++ integer_to_list(Port))
+         ++ if_not_empty(filter_default_port(Scheme, Port), ":" ++ integer_to_list(Port))
          ++ Path
          ++ Query.
 
 if_not_empty([_], Result) -> Result;  % не хватает в эрланге тренарного оператора ?: 
 if_not_empty([],       _) -> [].
 
-filter_default_port({http,   80})    -> [];
-filter_default_port({https, 443})    -> [];
-filter_default_port({ftp,    21})    -> [];
-filter_default_port({_Scheme, Port}) -> Port.
+filter_default_port(http,      80) -> [];
+filter_default_port(https,    443) -> [];
+filter_default_port(ftp,       21) -> [];
+filter_default_port(_Scheme, Port) -> Port.
 
 skip_query(Url) ->
     QPos = string:str(Url, "?"),
