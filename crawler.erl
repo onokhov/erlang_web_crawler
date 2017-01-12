@@ -78,7 +78,7 @@ fetch_and_save(Url) ->
         {ok, RequestId} ->
             %% io:format("~w ~s~n",[RequestId, Url]),
             {Html, UrlsToFetch} = parse_html(receive_text_data(RequestId), Url),
-            save_to_file(Html, path_to_index(Url)),
+            save_to_file(Html, url_to_filename(path_to_index(Url))),
             sets:to_list(sets:from_list(UrlsToFetch)) % возвращаем урлы, удалив дубликаты
     end.
 
@@ -132,25 +132,20 @@ parse_html(Html, BaseUrl) ->
     case M of
         nomatch ->
             case Html of
-                [] ->
-                    {[], []};
-                _ ->
-                    {binary_to_list(Html), []}
+                [] -> {[], []};
+                _ -> {binary_to_list(Html), []}
             end;
         {match, CapturedPositions} ->
             extract_links(CapturedPositions, Html, [], 0, BaseUrl, [])
     end.
 
-save_to_file([],  _Url) -> ok;
-save_to_file(Html, Url) ->
-    Filename = url_to_filename(Url),
-    filelib:ensure_dir(filename:dirname(Filename)++"/"),
-    %% io:format("f: ~s, d: ~s~n",[Filename, filename:dirname(Filename)++"/"]),
+save_to_file([],  _Filename) -> ok;
+save_to_file(Html, Filename) ->
+    filelib:ensure_dir(filename:dirname(Filename) ++ "/"),
     file:write_file(Filename, Html).
 
 url_to_filename(Url) ->
-    Pos = string:str(Url, "://"),
-    "." ++ string:substr(Url, Pos + 2).
+    "./" ++ lists:nth(2, re:split(Url, "://", [{parts,2}, {return,list}])).
 
 path_to_index(Url) -> % если ссылка на каталог, то приписываем к ней index.html
      case lists:last(Url) of
@@ -165,10 +160,8 @@ path_to_index(Url) -> % если ссылка на каталог, то прип
 % @doc эту функцию используем вместо http_uri:parse потому как на не абсолютных урлах http_uri:parse падает
 parse_url(Url) -> % {ok, [Scheme, Authority, Path, Query, Fragment]} | error
     case re:run(Url, "(?:([^:/?#]+):)?(?://([^/?#]*))?([^?#]*)(?:\\?([^#]*))?(?:#(.*))?", [{capture, all_but_first, list}]) of
-        {match, Captured} ->
-            {ok, lists:sublist(Captured, 3) ++ [[], []]}; % не работаем с query и fragment, для crawler`а они не нужны
-        nomatch ->
-            error
+        {match, Captured} -> {ok, lists:sublist(Captured, 3) ++ [[], []]}; % не работаем с query и fragment, для crawler`а они не нужны
+        nomatch           -> error
     end.
 
 url_to_absolute(Url, BaseUrl) ->
@@ -177,16 +170,13 @@ url_to_absolute(Url, BaseUrl) ->
             normalize_url(Url);
         nomatch ->
             {ok, {Scheme, UserInfo, Host, Port, Path, _Query}} = http_uri:parse(BaseUrl),
-            [UrlPath, UrlQuery] = case re:run(Url,"^([\\?]+)(\\?.*)",[{capture, all_but_first, list}]) of
-                                       nomatch -> [Url,[]];
-                                       {match, {Part1, Part2}} ->
-                                          [Part1, Part2]
+            [UrlPath, UrlQuery] = case re:split(Url,"\\?",[{parts,2},{return,list}]) of
+                                       [U,Q] -> [U,"?"++Q];
+                                       [U]   -> [U,[]]
                                    end,
-            case string:str(Url, "//") == 1 of
-                true ->                     % url just has no scheme
-                    term_to_string(Scheme) ++ ":" ++ Url;
-                false ->
-                    compose_url({Scheme, UserInfo, Host, Port, merge_paths(clean_path(Path), UrlPath), UrlQuery})
+            case Url of
+                [$/,$/| _ ] -> term_to_string(Scheme) ++ ":" ++ Url; % url just has no scheme
+                _ -> compose_url({Scheme, UserInfo, Host, Port, merge_paths(clean_path(Path), UrlPath), UrlQuery})
             end
     end.
 
@@ -224,28 +214,21 @@ remove_dots(Path) ->
 
 remove_double_dots(Path) ->
     NewPath = re:replace(Path,"[^/.]+/\\.\\./","",[{return,list}]),
-    case string:equal(Path,NewPath) of
-        true ->
-            Path;
-        false ->
-            remove_double_dots(NewPath)
+    case NewPath of
+        Path  -> Path;
+        _     -> remove_double_dots(NewPath)
     end.
 
 is_url_of_host(Url, Host) ->
     case re:run(Url,"^https?://" ++ Host, [caseless]) of
-        {match, _} ->                   
-            true;
-        nomatch ->
-            false
+        {match, _} -> true;
+        nomatch    -> false
     end.
-    
 
 normalize_url(Url) ->
     case re:run(Url,"^https?:",[caseless]) of
-        {match, _} ->                   
-            compose_url(http_uri:parse(Url));
-        nomatch ->
-            Url
+        {match, _} -> compose_url(http_uri:parse(Url));
+        nomatch    -> Url
     end.
 
 term_to_string(Term) ->
