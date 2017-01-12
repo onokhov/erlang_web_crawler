@@ -270,16 +270,4 @@ filter_default_port(ftp,       21) -> [];
 filter_default_port(_Scheme, Port) -> Port.
 
 skip_query(Url) ->
-    QPos = string:str(Url, "?"),
-    case QPos of
-        0 ->
-            FPos = string:str(Url, "#"),
-            case FPos of
-                0 ->
-                    Url;
-                _ ->
-                    string:substr(Url, 1, FPos - 1)
-            end;
-        _ ->
-            string:substr(Url, 1, QPos - 1)
-     end.
+    lists:nth(1,re:split(Url,"[\\?#]",[{parts,2},{return,list}])).
