@@ -253,4 +253,4 @@ filter_default_port(ftp,       21) -> [];
 filter_default_port(_Scheme, Port) -> Port.
 
 skip_query(Url) ->
-    lists:nth(1,re:split(Url,"[\\?#]",[{parts,2},{return,list}])).
+    lists:takewhile(fun(C)-> C=/=$? andalso C=/=$# end, Url).
