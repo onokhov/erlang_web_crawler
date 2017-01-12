@@ -76,6 +76,7 @@ fetch_and_save(Url) ->
             io:format("Error fetching ~s: ~w~n", [Url, Reason]),
             []; % разбирать ошибки загрузки не хочу, достаточно сообщения в лог. Пусть пользователь сам решает, что делать. 
         {ok, RequestId} ->
+            %% io:format("~w ~s~n",[RequestId, Url]),
             {Html, UrlsToFetch} = parse_html(receive_text_data(RequestId), Url),
             save_to_file(Html, path_to_index(Url)),
             sets:to_list(sets:from_list(UrlsToFetch)) % возвращаем урлы, удалив дубликаты
@@ -93,16 +94,22 @@ receive_text_data(RequestId) ->
                 [] -> receive_error(RequestId, "skip non text document");
                 _  -> receive_text_data(RequestId, <<>>)
             end;
-        {http, {RequestId, {error, Reason}}} -> receive_error(RequestId, lists:flatten(io_lib:format("~p",Reason)))
-    after 10000 -> receive_error(RequestId, "receive timeout")
+        {http, {RequestId, {error, Reason}}} ->
+            receive_error(RequestId, term_to_string(Reason));
+        {http, {RequestId, {{_HTTPConnectionString,StatusCode,StatusMessage},_Headers,_Body}}} -> 
+            receive_error(RequestId, term_to_string([StatusCode, StatusMessage]));
+        Any ->
+            receive_error(RequestId, term_to_string(Any))
+    after 10000 -> receive_error(RequestId, "receive timeout start")
     end.
 
 receive_text_data(RequestId, Acc) ->
     receive
-        {http, {RequestId, {error, Reason}}}      -> receive_error(RequestId, lists:flatten(io_lib:format("~p",Reason)));
+        {http, {RequestId, {error, Reason}}}      -> receive_error(RequestId, term_to_string(Reason));
         {http, {RequestId, stream, BinBodyPart}}  -> receive_text_data( RequestId, <<Acc/binary,BinBodyPart/binary>> );
-        {http, {RequestId, stream_end, _Headers}} -> Acc
-    after 10000 -> receive_error(RequestId, "receive timeout")
+        {http, {RequestId, stream_end, _Headers}} -> Acc;
+        Any                                       -> receive_error(RequestId, term_to_string(Any))
+    after 10000 -> receive_error(RequestId, "receive timeout inner")
     end.
 
 %% @doc возвращает html с преобразованными ссылками из абсолютных в относительные и список ссылок для загрузки
@@ -177,7 +184,7 @@ url_to_absolute(Url, BaseUrl) ->
                                    end,
             case string:str(Url, "//") == 1 of
                 true ->                     % url just has no scheme
-                    scheme_to_string(Scheme) ++ ":" ++ Url;
+                    term_to_string(Scheme) ++ ":" ++ Url;
                 false ->
                     compose_url({Scheme, UserInfo, Host, Port, merge_paths(clean_path(Path), UrlPath), UrlQuery})
             end
@@ -203,7 +210,7 @@ url_to_relative(Url, BaseUrl) ->
     end.
 
 strip_common_head([H|T1],[H|T2]) -> strip_common_head(T1,T2);
-strip_common_head(A,B)           ->    {A,B}.
+strip_common_head(A,B)           -> {A,B}.
 
 merge_paths(_Base, [$/,_] = Path) -> remove_dots(Path);
 merge_paths( Base,          Path) -> remove_dots(Base ++ "/" ++ Path).
@@ -241,13 +248,13 @@ normalize_url(Url) ->
             Url
     end.
 
-scheme_to_string(Scheme) ->
-    lists:flatten(io_lib:format("~p",[Scheme])).
+term_to_string(Term) ->
+    lists:flatten(io_lib:format("~p",[Term])).
 
 compose_url({ok,Result}) ->
     compose_url(Result);
 compose_url({Scheme, UserInfo, Host, Port, Path, Query}) ->
-     scheme_to_string(Scheme) ++ "://"
+     term_to_string(Scheme) ++ "://"
          ++ if_not_empty(UserInfo, UserInfo ++ "@")
          ++ string:to_lower(Host)
          ++ if_not_empty(filter_default_port(Scheme, Port), ":" ++ integer_to_list(Port))
