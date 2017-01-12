@@ -202,19 +202,11 @@ url_to_relative(Url, BaseUrl) ->
             end
     end.
 
-strip_common_head([H|T1],[H|T2]) ->
-    strip_common_head(T1,T2);
-strip_common_head(A,B) ->
-    {A,B}.
+strip_common_head([H|T1],[H|T2]) -> strip_common_head(T1,T2);
+strip_common_head(A,B)           ->    {A,B}.
 
-merge_paths(Base, Path) ->
-    P = case string:sub_string(Path,1,1) of
-            "/" ->
-                Path;
-            _ ->
-                Base ++ "/" ++ Path
-        end,
-    remove_dots(P).
+merge_paths(_Base, [$/,_] = Path) -> remove_dots(Path);
+merge_paths( Base,          Path) -> remove_dots(Base ++ "/" ++ Path).
 
 clean_path(Path) -> % оставляет путь без имени файла в урле
     string:sub_string(Path, 1, string:rchr(Path, $/)).
