@@ -81,32 +81,28 @@ fetch_and_save(Url) ->
             sets:to_list(sets:from_list(UrlsToFetch)) % возвращаем урлы, удалив дубликаты
     end.
 
+receive_error(RequestId, Message) ->
+    io:format("receive error: ~s~n",[Message]),
+    httpc:cancel_request(RequestId),
+    <<>>.
+
 receive_text_data(RequestId) ->
-            receive_text_data(RequestId, <<>>).
+    receive
+        {http, {RequestId, stream_start, Headers}} ->
+            case [ ok || {"content-type", [$t,$e,$x,$t,$/|_]} <- Headers ] of
+                [] -> receive_error(RequestId, "skip non text document");
+                _  -> receive_text_data(RequestId, <<>>)
+            end;
+        {http, {RequestId, {error, Reason}}} -> receive_error(RequestId, lists:flatten(io_lib:format("~p",Reason)))
+    after 10000 -> receive_error(RequestId, "receive timeout")
+    end.
 
 receive_text_data(RequestId, Acc) ->
     receive
-        {http, {RequestId, stream_start, _Headers}} when Acc =/= <<>> ->
-                    io:format("unexpected stream_start message~n"),
-                    httpc:cancel_request(RequestId),
-                    <<>>;
-        {http, {RequestId, stream_start, Headers}} ->
-            case [ ok || {"content-type", [$t,$e,$x,$t,$/|_]} <- Headers ] of
-                [] ->
-                    io:format("skip non text document~n"),
-                    httpc:cancel_request(RequestId),
-                    <<>>;
-                _ ->
-                    receive_text_data(RequestId, Acc)
-            end;
-        {http, {RequestId, stream, BinBodyPart}} ->
-            receive_text_data( RequestId, <<Acc/binary,BinBodyPart/binary>> );
-        {http, {RequestId, stream_end, _Headers}} ->
-            Acc
-    after 10000 ->
-            io:format("receive timeout~n"),
-            httpc:cancel_request(RequestId),
-            <<>>
+        {http, {RequestId, {error, Reason}}}      -> receive_error(RequestId, lists:flatten(io_lib:format("~p",Reason)));
+        {http, {RequestId, stream, BinBodyPart}}  -> receive_text_data( RequestId, <<Acc/binary,BinBodyPart/binary>> );
+        {http, {RequestId, stream_end, _Headers}} -> Acc
+    after 10000 -> receive_error(RequestId, "receive timeout")
     end.
 
 %% @doc возвращает html с преобразованными ссылками из абсолютных в относительные и список ссылок для загрузки
