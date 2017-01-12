@@ -212,7 +212,7 @@ url_to_relative(Url, BaseUrl) ->
 strip_common_head([H|T1],[H|T2]) -> strip_common_head(T1,T2);
 strip_common_head(A,B)           -> {A,B}.
 
-merge_paths(_Base, [$/,_] = Path) -> remove_dots(Path);
+merge_paths(_Base, [$/|_] = Path) -> remove_dots(Path);
 merge_paths( Base,          Path) -> remove_dots(Base ++ "/" ++ Path).
 
 clean_path(Path) -> % оставляет путь без имени файла в урле
