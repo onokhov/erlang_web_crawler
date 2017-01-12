@@ -24,9 +24,9 @@ crawler(Url, WorkersMaxNum) when WorkersMaxNum >= 1 ->
     case file:consult(Host ++ ".state") of   % пытаемся восстановить состояние прерванной загрузки
         {ok, [[UrlsRestored, SeenUrlsRestored]]} -> 
             io:format("Resume download session~n"),
-            crawler(WorkersMaxNum, 0, Host, UrlsRestored, SeenUrlsRestored, []);
+            crawler(Host, WorkersMaxNum, UrlsRestored, [], SeenUrlsRestored);
         _ -> 
-            crawler(WorkersMaxNum, 0, Host, [Url], [], [])
+            crawler(Host, WorkersMaxNum, [Url], [], [])
     end,
     ssl:stop(),  % останавливаем службы httpc
     inets:stop(),
@@ -38,26 +38,25 @@ crawler(_,_) ->
 %% раздаём задания воркерам,
 %% ожидаем сообщения от воркеров, в которых они передают новые задания для загрузки
 %% ожидаем сообщение от таймера, по которому сохраняем текущее состояние загрузки в файл
-crawler(_WorkersMaxNum, 0, Host, [], _SeenUrls, _UrlsInProgress) ->  % паттерн завершения работы, всё загружено
+crawler(Host, _SpareWorkersNum, [], [], _SeenUrls) ->  % паттерн завершения работы, всё загружено
     file:delete(Host ++ ".state"); %  удаляем файл состояния загрузки
-crawler(WorkersMaxNum, WorkersNum, Host, [Url|UrlsLeft], SeenUrls, UrlsInProgress) when WorkersNum < WorkersMaxNum -> % паттерн раздачи заданий по воркерам
+crawler(Host, SpareWorkersNum, [Url|UrlsLeft], UrlsInProgress, SeenUrls) when SpareWorkersNum > 0 -> % паттерн раздачи заданий по воркерам
     spawn(crawler, worker, [self(), Url]),
-    crawler(WorkersMaxNum, WorkersNum + 1, Host, UrlsLeft, SeenUrls, [Url|UrlsInProgress]); 
-crawler(WorkersMaxNum, WorkersNum, Host, Urls, SeenUrls, UrlsInProgress) when WorkersMaxNum == WorkersNum orelse Urls =:= [] -> % ждать сообщений, если нет свободных воркеров или нет свободных урлов
+    crawler(Host, SpareWorkersNum - 1, UrlsLeft, [Url|UrlsInProgress], SeenUrls); 
+crawler(Host, SpareWorkersNum, Urls, UrlsInProgress, SeenUrls) -> % здесь SpareWorkersNum == 0 orelse Urls =:= [], ждём сообщений
     receive
         save_state -> % это от таймера. Сохраним состояние и вернёмся в ожидание
             io:format("saving state...~n"),
             file:write_file(Host ++ ".state", io_lib:format("~p.~n", [[UrlsInProgress ++ Urls, SeenUrls]])),
             erlang:send_after(10000, self(), save_state),    % через 10 секунд снова хотим сохранить состояние загрузки
-            crawler(WorkersMaxNum, WorkersNum, Host, Urls, SeenUrls, UrlsInProgress);
+            crawler(Host, SpareWorkersNum, Urls, UrlsInProgress, SeenUrls); % возвращаемся в ожидание сообщений
         [UrlFetched, NewUrls] -> % воркер прислал новые урлы
-            crawler(WorkersMaxNum,
-                    WorkersNum - 1,
-                    Host,
+            crawler(Host,
+                    SpareWorkersNum + 1,
                     %% фильтруем новые задания, не берем те, что уже сделаны или с других хостов
                     [U || U <- NewUrls, is_url_of_host(U, Host) andalso not lists:member(U, SeenUrls) andalso not lists:member(U, UrlsInProgress)], 
-                    [UrlFetched|SeenUrls], 
-                    lists:delete(UrlFetched, UrlsInProgress)
+                    lists:delete(UrlFetched, UrlsInProgress),
+                    [UrlFetched|SeenUrls]
                     )
     after 15000 ->
             io:format("Crawler timed out~n") % что-то пошло не так
@@ -75,7 +74,7 @@ fetch_and_save(Url) ->
     case R of
         {error, Reason} ->
             io:format("Error fetching ~s: ~w~n", [Url, Reason]),
-            [];
+            []; % разбирать ошибки загрузки не хочу, достаточно сообщения в лог. Пусть пользователь сам решает, что делать. 
         {ok, RequestId} ->
             {Html, UrlsToFetch} = parse_html(receive_text_data(RequestId), Url),
             save_to_file(Html, path_to_index(Url)),
@@ -83,31 +82,32 @@ fetch_and_save(Url) ->
     end.
 
 receive_text_data(RequestId) ->
-            receive_text_data(RequestId, []).
+            receive_text_data(RequestId, <<>>).
 
-receive_text_data(RequestId, Accumulator) ->
+receive_text_data(RequestId, Acc) ->
     receive
+        {http, {RequestId, stream_start, _Headers}} when Acc =/= <<>> ->
+                    io:format("unexpected stream_start message~n"),
+                    httpc:cancel_request(RequestId),
+                    <<>>;
         {http, {RequestId, stream_start, Headers}} ->
-            case is_text_headers(Headers) of
-                true ->
-                    receive_text_data(RequestId);
-                false ->
+            case [ ok || {"content-type", [$t,$e,$x,$t,$/|_]} <- Headers ] of
+                [] ->
                     io:format("skip non text document~n"),
                     httpc:cancel_request(RequestId),
-                    []
+                    <<>>;
+                _ ->
+                    receive_text_data(RequestId, Acc)
             end;
         {http, {RequestId, stream, BinBodyPart}} ->
-            receive_text_data( RequestId, [BinBodyPart|Accumulator] );
+            receive_text_data( RequestId, <<Acc/binary,BinBodyPart/binary>> );
         {http, {RequestId, stream_end, _Headers}} ->
-            list_to_binary(lists:reverse(Accumulator))
+            Acc
     after 10000 ->
             io:format("receive timeout~n"),
             httpc:cancel_request(RequestId),
-            []
+            <<>>
     end.
-
-is_text_headers(Headers) ->
-    [] =/= [ ok || {"content-type", [$t,$e,$x,$t,$/|_]} <- Headers ].
 
 %% @doc возвращает html с преобразованными ссылками из абсолютных в относительные и список ссылок для загрузки
 extract_links([], _Html, ParsedParts, _Pos, _BaseUrl, Links) ->
@@ -155,12 +155,10 @@ url_to_filename(Url) ->
     "." ++ string:substr(Url, Pos + 2).
 
 path_to_index(Url) -> % если ссылка на каталог, то приписываем к ней index.html
-    case string:right(Url,1) == "/" of
-        true ->
-            Url ++ "index.html";
-        false ->
-            Url
-    end.
+     case lists:last(Url) of
+         $/ -> Url ++ "index.html";
+         _  -> Url
+     end.
 
 %%%
 %%% ниже определены функции преобразования url и вспомогательные для преобразований
