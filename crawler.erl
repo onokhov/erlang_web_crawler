@@ -138,17 +138,12 @@ parse_html(Html, BaseUrl) ->
             extract_links(CapturedPositions, Html, [], 0, BaseUrl, [])
     end.
 
+save_to_file([],  _Url) -> ok;
 save_to_file(Html, Url) ->
-%    io:format("save ~w bytes to ~s~n",[string:len(Html), url_to_filename(Url)]),
-    case string:len(Html) of
-        0 ->
-            ok;
-        _ ->
-            Filename = url_to_filename(Url),
-            filelib:ensure_dir(filename:dirname(Filename)++"/"),
-%     io:format("f: ~s, d: ~s~n",[Filename, filename:dirname(Filename)++"/"]),
-            file:write_file(Filename, Html)
-    end.
+    Filename = url_to_filename(Url),
+    filelib:ensure_dir(filename:dirname(Filename)++"/"),
+    %% io:format("f: ~s, d: ~s~n",[Filename, filename:dirname(Filename)++"/"]),
+    file:write_file(Filename, Html).
 
 url_to_filename(Url) ->
     Pos = string:str(Url, "://"),
